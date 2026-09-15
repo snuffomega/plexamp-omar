@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "id": "community.plexarchy",
+  "name": "Plexarchy",
+  "version": "1.0.0",
+  "author": "Plexarchy contributors",
+  "license": "MIT",
+  "description": "Plex music in the Omarchy bar: now playing, playback controls, and an attached library, search, playlist, and queue panel powered by mpv.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Plexarchy",
+    "description": "Plex music player and browser",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "recentAlbumCount": 20,
+      "libraryItemCount": 100,
+      "demoMode": false,
+      "volumeMode": "System",
+      "showBarControls": true
+    },
+    "schema": [
+      {
+        "key": "recentAlbumCount",
+        "type": "integer",
+        "label": "Recent albums",
+        "min": 5,
+        "max": 50,
+        "step": 5,
+        "defaultValue": 20,
+        "description": "Number of recently added albums shown on the Home view."
+      },
+      {
+        "key": "libraryItemCount",
+        "type": "integer",
+        "label": "Library items per view",
+        "min": 25,
+        "max": 250,
+        "step": 25,
+        "defaultValue": 100,
+        "description": "Maximum artists, albums, playlists, or tracks loaded in one view."
+      },
+      {
+        "key": "showBarControls",
+        "type": "boolean",
+        "label": "Bar playback controls",
+        "defaultValue": true,
+        "description": "Show previous, play/pause, and next buttons next to the track in the bar."
+      },
+      {
+        "key": "volumeMode",
+        "type": "enum",
+        "label": "Volume control",
+        "options": ["System", "Plex"],
+        "defaultValue": "System",
+        "description": "Choose whether the player slider changes the Omarchy system output or Plexarchy's local mpv volume."
+      },
+      {
+        "key": "demoMode",
+        "type": "boolean",
+        "label": "Demo mode",
+        "defaultValue": false,
+        "description": "Show fictional music and never contact Plex or start mpv."
+      }
+    ]
+  }
+}

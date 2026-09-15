@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+tests/qml-harness/imports/Quickshell/Io/HarnessConfig.js
+.ruff_cache/
+memory/test_credentials.md
+**/.emergent/recordings/
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials

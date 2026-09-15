@@ -1,0 +1,12 @@
+cron=3.0pl1-162
+mpv=0.35.1-4
+qml-qt6=6.4.2+dfsg-1
+qml6-module-qtqml=6.4.2+dfsg-1
+qml6-module-qtqml-workerscript=6.4.2+dfsg-1
+qml6-module-qtquick=6.4.2+dfsg-1
+qml6-module-qtquick-controls=6.4.2+dfsg-1
+qml6-module-qtquick-layouts=6.4.2+dfsg-1
+qml6-module-qtquick-shapes=6.4.2+dfsg-1
+qml6-module-qtquick-templates=6.4.2+dfsg-1
+qml6-module-qtquick-window=6.4.2+dfsg-1
+qt6-declarative-dev-tools=6.4.2+dfsg-1

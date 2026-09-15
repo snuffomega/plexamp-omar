@@ -1,0 +1,2395 @@
+#!/usr/bin/env python3
+"""Small dependency-free Plex music client and mpv controller."""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import concurrent.futures
+import contextlib
+import fcntl
+import getpass
+import hashlib
+import json
+import os
+import pathlib
+import random
+import re
+import secrets
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from typing import Any
+
+APP = "plexarchy"
+CONFIG_DIR = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / APP
+CONFIG_FILE = CONFIG_DIR / "config.json"
+CACHE_DIR = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / APP
+STATE_FILE = CACHE_DIR / "state.json"
+SOCKET_FILE = CACHE_DIR / "mpv.sock"
+DATA_CACHE_DIR = CACHE_DIR / "data"
+ART_CACHE_DIR = CACHE_DIR / "art"
+APP_NAME = "Plexarchy"
+APP_VERSION = "1.0.0"
+PLEX_AUTH_URL = os.environ.get("PLEXARCHY_PLEX_TV_URL", "https://plex.tv/api/v2")
+TIMELINE_INTERVAL_SECONDS = 10
+CONFIG_MAX_BYTES = 64 * 1024
+STATE_MAX_BYTES = 8 * 1024 * 1024
+DATA_MAX_BYTES = 16 * 1024 * 1024
+ART_MAX_BYTES = 4 * 1024 * 1024
+PLEX_JSON_MAX_BYTES = 16 * 1024 * 1024
+PLEX_CLOUD_JSON_MAX_BYTES = 1024 * 1024
+CACHE_MAX_BYTES = 256 * 1024 * 1024
+MPV_REPLY_MAX_BYTES = 16 * 1024 * 1024
+PLAYBACK_QUEUE_MAX_ITEMS = 500
+SEARCH_QUERY_MAX_CHARS = 256
+PLEX_LOGIN_TIMEOUT_SECONDS = 300
+PLEX_LINK_TIMEOUT_SECONDS = 900
+ART_MAX_DIMENSION = 4096
+ART_MAX_PIXELS = 16_000_000
+ATOMIC_TEMP_GRACE_SECONDS = 3600
+ATOMIC_TEMP_PATTERN = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
+ART_CACHE_LOCK = threading.Lock()
+
+
+class PlayerError(RuntimeError):
+    def __init__(self, message: str, code: str = "unknown") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def safe_int(value: Any, fallback: int = 0) -> int:
+    if value is None or value == "":
+        return fallback
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+
+
+def safe_float(value: Any, fallback: float = 0.0) -> float:
+    if value is None or value == "":
+        return fallback
+    try:
+        result = float(value)
+        return result if result == result and abs(result) != float("inf") else fallback
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+
+
+def normalized_origin(url: str) -> tuple[str, str, int]:
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise PlayerError("The Plex server URL must be an HTTP or HTTPS origin.", "invalid-server")
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError as error:
+        raise PlayerError("The Plex server URL has an invalid port.", "invalid-server") from error
+    return scheme, parsed.hostname.lower(), port
+
+
+def normalize_server_url(url: str) -> str:
+    value = str(url).strip().rstrip("/")
+    scheme, host, port = normalized_origin(value)
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise PlayerError("The Plex server URL must be an origin without a path, query, or fragment.",
+                          "invalid-server")
+    display_host = f"[{host}]" if ":" in host else host
+    default_port = 443 if scheme == "https" else 80
+    suffix = "" if port == default_port else f":{port}"
+    return f"{scheme}://{display_host}{suffix}"
+
+
+class SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep credential-bearing Plex requests on their original origin."""
+
+    def redirect_request(self, request: Any, fp: Any, code: int, message: str,
+                         headers: Any, new_url: str) -> Any:
+        target = urllib.parse.urljoin(request.full_url, new_url)
+        if normalized_origin(request.full_url) != normalized_origin(target):
+            raise PlayerError("Plex redirected a credentialed request to another origin.", "unsafe-redirect")
+        return super().redirect_request(request, fp, code, message, headers, target)
+
+
+SAFE_URL_OPENER = urllib.request.build_opener(SameOriginRedirectHandler())
+
+
+def safe_urlopen(request: urllib.request.Request, timeout: float) -> Any:
+    return SAFE_URL_OPENER.open(request, timeout=timeout)
+
+
+def directory_open_flags() -> int:
+    required = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")
+    if not all(hasattr(os, name) for name in required):
+        raise PlayerError("Secure local storage is unavailable on this system.", "local-security")
+    return os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def validate_directory(descriptor: int, label: str, system_owner: int, private: bool = False) -> None:
+    details = os.fstat(descriptor)
+    mode = stat.S_IMODE(details.st_mode)
+    owner = os.geteuid()
+    if not stat.S_ISDIR(details.st_mode):
+        raise PlayerError(f"{label} is not a directory.", "local-security")
+    if details.st_uid not in (system_owner, owner):
+        raise PlayerError(f"{label} has an unsafe owner.", "local-security")
+    if private:
+        if details.st_uid != owner or mode != 0o700:
+            raise PlayerError(f"{label} must be owned by you with mode 0700.", "local-security")
+    elif mode & 0o022 and not mode & stat.S_ISVTX:
+        raise PlayerError(f"{label} has unsafe permissions.", "local-security")
+
+
+@contextlib.contextmanager
+def secure_parent_directory(path: pathlib.Path, create: bool = False) -> Any:
+    absolute = pathlib.Path(os.path.abspath(os.fspath(path)))
+    filename = absolute.name
+    if not filename or filename in (".", ".."):
+        raise PlayerError("The local storage path is invalid.", "local-security")
+    flags = directory_open_flags()
+    try:
+        descriptor = os.open("/", flags)
+    except OSError as error:
+        raise PlayerError("The filesystem root could not be opened safely.", "local-security") from error
+    try:
+        system_owner = os.fstat(descriptor).st_uid
+        validate_directory(descriptor, "/", system_owner)
+        components = absolute.parent.parts[1:]
+        for index, component in enumerate(components):
+            final = index == len(components) - 1
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                except OSError as error:
+                    raise PlayerError(f"{component} could not be created safely.", "local-security") from error
+                try:
+                    child = os.open(component, flags, dir_fd=descriptor)
+                except OSError as error:
+                    raise PlayerError(f"{component} could not be opened safely.", "local-security") from error
+            except OSError as error:
+                raise PlayerError(f"{component} could not be opened safely.", "local-security") from error
+            try:
+                validate_directory(child, component, system_owner, private=final)
+            except Exception:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor, filename
+    finally:
+        os.close(descriptor)
+
+
+def ensure_private_dir(path: pathlib.Path) -> None:
+    with secure_parent_directory(path / ".directory-check", create=True):
+        pass
+
+
+def write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        try:
+            written = os.write(descriptor, payload[offset:])
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError("The local storage write made no progress.")
+        offset += written
+
+
+def atomic_bytes(path: pathlib.Path, value: bytes, mode: int = 0o600, maximum: int = 16 * 1024 * 1024) -> None:
+    if mode != 0o600 or len(value) > maximum:
+        raise PlayerError("Local data exceeded its security policy.", "local-security")
+    with secure_parent_directory(path, create=True) as (parent, filename):
+        descriptor = -1
+        temporary = ""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        for _ in range(16):
+            temporary = f".{filename}.{secrets.token_hex(16)}.tmp"
+            try:
+                descriptor = os.open(temporary, flags, mode, dir_fd=parent)
+                break
+            except FileExistsError:
+                continue
+            except OSError as error:
+                raise PlayerError(f"{filename} could not be created safely.", "local-security") from error
+        if descriptor < 0:
+            raise PlayerError(f"{filename} could not create a unique temporary file.", "local-security")
+        try:
+            details = os.fstat(descriptor)
+            if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid() or stat.S_IMODE(details.st_mode) != mode:
+                raise PlayerError(f"{filename} temporary file is unsafe.", "local-security")
+            write_all(descriptor, value)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary, filename, src_dir_fd=parent, dst_dir_fd=parent)
+            temporary = ""
+            os.fsync(parent)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if temporary:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temporary, dir_fd=parent)
+
+
+def json_bytes(value: Any, maximum: int) -> bytes:
+    payload = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if len(payload) > maximum:
+        raise PlayerError("Local data exceeded its security policy.", "local-security")
+    return payload
+
+
+def atomic_json(path: pathlib.Path, value: Any, mode: int = 0o600, maximum: int = 16 * 1024 * 1024) -> None:
+    payload = json_bytes(value, maximum)
+    atomic_bytes(path, payload, mode, maximum)
+
+
+def read_regular_file(path: pathlib.Path, maximum: int = 16 * 1024 * 1024) -> bytes:
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
+    with secure_parent_directory(path) as (parent, filename):
+        try:
+            descriptor = os.open(filename, flags, dir_fd=parent)
+        except FileNotFoundError:
+            raise
+        except OSError as error:
+            raise PlayerError(f"{filename} could not be opened safely.", "local-security") from error
+        try:
+            details = os.fstat(descriptor)
+            mode = stat.S_IMODE(details.st_mode)
+            if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid() or mode & 0o077:
+                raise PlayerError(f"{filename} must be a private regular file owned by you.", "local-security")
+            if details.st_size > maximum:
+                raise PlayerError(f"{filename} exceeded its size limit.", "local-security")
+            payload = bytearray()
+            while len(payload) <= maximum:
+                chunk = os.read(descriptor, min(65536, maximum + 1 - len(payload)))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > maximum:
+                raise PlayerError(f"{filename} exceeded its size limit.", "local-security")
+            return bytes(payload)
+        finally:
+            os.close(descriptor)
+
+
+def load_json(path: pathlib.Path, fallback: Any, maximum: int = 16 * 1024 * 1024) -> Any:
+    try:
+        return json.loads(read_regular_file(path, maximum).decode("utf-8"))
+    except FileNotFoundError:
+        return fallback
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return fallback
+
+
+def secure_stat(path: pathlib.Path) -> os.stat_result | None:
+    try:
+        with secure_parent_directory(path) as (parent, filename):
+            return os.stat(filename, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def secure_unlink(path: pathlib.Path) -> None:
+    try:
+        with secure_parent_directory(path) as (parent, filename):
+            os.unlink(filename, dir_fd=parent)
+            os.fsync(parent)
+    except FileNotFoundError:
+        return
+
+
+def secure_utime(path: pathlib.Path) -> None:
+    with secure_parent_directory(path) as (parent, filename):
+        os.utime(filename, None, dir_fd=parent, follow_symlinks=False)
+
+
+def load_settings() -> dict[str, Any]:
+    data = load_json(CONFIG_FILE, {}, CONFIG_MAX_BYTES)
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(changes: dict[str, Any]) -> dict[str, Any]:
+    data = load_settings()
+    for key, value in changes.items():
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
+    atomic_json(CONFIG_FILE, data, maximum=CONFIG_MAX_BYTES)
+    return data
+
+
+def client_identifier() -> str:
+    data = load_settings()
+    identifier = str(data.get("clientIdentifier", ""))
+    if not identifier:
+        identifier = str(uuid.uuid4())
+        save_settings({"clientIdentifier": identifier})
+    return identifier
+
+
+def connection_enabled(config: dict[str, Any]) -> bool:
+    return config.get("connectionEnabled") is not False
+
+
+def load_config(required: bool = True, include_disabled: bool = False) -> dict[str, Any]:
+    data = load_settings()
+    if not isinstance(data, dict) or not data.get("server") or not data.get("token"):
+        if required:
+            raise PlayerError("Link your Plex account and choose a server first.", "unconfigured")
+        return {}
+    data["server"] = normalize_server_url(str(data["server"]))
+    if not include_disabled and not connection_enabled(data):
+        if required:
+            raise PlayerError("The Plex connection is turned off.", "disconnected")
+        return {}
+    return data
+
+
+def response_json(response: Any, maximum: int, allow_list: bool = False) -> Any:
+    payload = response.read(maximum + 1)
+    if len(payload) > maximum:
+        raise PlayerError("Plex returned an oversized response.", "invalid-response")
+    try:
+        result = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise PlayerError("Plex returned an unreadable response.", "invalid-response") from error
+    if allow_list and isinstance(result, list):
+        return result
+    if not isinstance(result, dict):
+        raise PlayerError("Plex returned an unexpected response.", "invalid-response")
+    return result
+
+
+def plex_request(config: dict[str, Any], path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    query = dict(params or {})
+    url = config["server"] + path
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "X-Plex-Token": str(config["token"]),
+            "X-Plex-Client-Identifier": str(config.get("clientIdentifier") or client_identifier()),
+            "X-Plex-Product": APP_NAME,
+            "X-Plex-Version": APP_VERSION,
+        },
+    )
+    try:
+        with safe_urlopen(request, timeout=10) as response:
+            return response_json(response, PLEX_JSON_MAX_BYTES)
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise PlayerError("Plex sign-in expired. Connect the account again.", "unauthorized") from error
+        raise PlayerError(f"Plex returned HTTP {error.code}.", "server-error") from error
+    except PlayerError:
+        raise
+    except urllib.error.URLError as error:
+        reason = str(getattr(error, "reason", error))
+        code = "dns" if "Name or service not known" in reason or "Temporary failure" in reason else "unreachable"
+        raise PlayerError(f"Plex is not reachable: {reason}", code) from error
+    except TimeoutError as error:
+        raise PlayerError("Plex did not answer in time.", "timeout") from error
+
+
+def plex_cloud_request(path: str, method: str = "GET", fields: dict[str, Any] | None = None,
+                       token: str = "", timeout: float = 10, allow_list: bool = False) -> Any:
+    identifier = client_identifier()
+    headers = {
+        "Accept": "application/json",
+        "X-Plex-Product": APP_NAME,
+        "X-Plex-Version": APP_VERSION,
+        "X-Plex-Client-Identifier": identifier,
+        "X-Plex-Device": "Omarchy",
+        "X-Plex-Device-Name": f"{APP_NAME} on {socket.gethostname()}",
+        "X-Plex-Model": "Omarchy bar plugin",
+        "X-Plex-Platform": "Linux",
+    }
+    if token:
+        headers["X-Plex-Token"] = token
+    url = PLEX_AUTH_URL + path
+    data = None
+    if fields and method == "GET":
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(fields)
+    elif fields:
+        data = urllib.parse.urlencode(fields).encode()
+    request = urllib.request.Request(url, headers=headers, data=data, method=method)
+    try:
+        with safe_urlopen(request, timeout=max(0.1, min(10, timeout))) as response:
+            return response_json(response, PLEX_CLOUD_JSON_MAX_BYTES, allow_list)
+    except urllib.error.HTTPError as error:
+        code = "unauthorized" if error.code in (401, 403) else "plex-cloud"
+        raise PlayerError(f"Plex sign-in returned HTTP {error.code}.", code) from error
+    except PlayerError:
+        raise
+    except (urllib.error.URLError, TimeoutError) as error:
+        raise PlayerError(f"Plex sign-in is not reachable: {error}", "plex-cloud") from error
+
+
+def choose_music_library(candidate: dict[str, Any], requested: str = "", interactive: bool = True) -> dict[str, Any]:
+    available = sections(candidate)
+    if not available:
+        raise PlayerError("This server has no Plex music library.", "no-library")
+    chosen = next((row for row in available if row["key"] == requested), None) if requested else None
+    if chosen is None and len(available) == 1:
+        chosen = available[0]
+    if chosen is None and not interactive:
+        chosen = available[0]
+    if chosen is None:
+        print("Music libraries:")
+        for index, row in enumerate(available, 1):
+            print(f"  {index}. {row['title']}")
+        selection = input("Choose a library [1]: ").strip() or "1"
+        try:
+            chosen = available[int(selection) - 1]
+        except (ValueError, IndexError) as error:
+            raise PlayerError("Invalid library selection.", "invalid-library") from error
+    candidate.update({"section": chosen["key"], "sectionTitle": chosen["title"]})
+    return candidate
+
+
+ACCOUNT_KEYS = ("clientIdentifier", "accountToken", "accountName", "accountLinkedAt")
+
+
+def replace_account(candidate: dict[str, Any]) -> None:
+    candidate = dict(candidate)
+    candidate["server"] = normalize_server_url(str(candidate.get("server", "")))
+    candidate.setdefault("clientIdentifier", client_identifier())
+    candidate["connectionEnabled"] = True
+    previous = load_config(False, include_disabled=True)
+    if previous and cache_namespace(previous) != cache_namespace(candidate):
+        shutdown_player(previous)
+        secure_unlink(STATE_FILE)
+    settings = load_settings()
+    for key in ACCOUNT_KEYS:
+        if key in settings and key not in candidate:
+            candidate[key] = settings[key]
+    atomic_json(CONFIG_FILE, candidate, maximum=CONFIG_MAX_BYTES)
+
+
+def link_url(pin_code: str) -> str:
+    params = urllib.parse.urlencode({
+        "clientID": client_identifier(),
+        "code": pin_code,
+        "context[device][product]": APP_NAME,
+        "context[device][platform]": "Linux",
+        "context[device][device]": "Omarchy",
+        "context[device][deviceName]": f"{APP_NAME} on {socket.gethostname()}",
+    })
+    return "https://app.plex.tv/auth#?" + params
+
+
+def link_start() -> dict[str, Any]:
+    pin = plex_cloud_request("/pins", method="POST", fields={"strong": "true"})
+    pin_id = str(pin.get("id", ""))
+    pin_code = str(pin.get("code", ""))
+    if not pin_id or not pin_code:
+        raise PlayerError("Plex did not create a sign-in request.", "auth-failed")
+    save_settings({"pendingLink": {"id": pin_id, "code": pin_code, "createdAt": int(time.time())}})
+    return {"id": pin_id, "code": pin_code, "url": link_url(pin_code), "expiresIn": PLEX_LINK_TIMEOUT_SECONDS}
+
+
+def link_poll() -> dict[str, Any]:
+    pending = load_settings().get("pendingLink")
+    if not isinstance(pending, dict) or not pending.get("id"):
+        raise PlayerError("No Plex sign-in is in progress.", "no-link")
+    pin_id, pin_code = str(pending.get("id")), str(pending.get("code", ""))
+    if time.time() - safe_int(pending.get("createdAt")) > PLEX_LINK_TIMEOUT_SECONDS:
+        save_settings({"pendingLink": None})
+        return {"linked": False, "expired": True}
+    result = plex_cloud_request(f"/pins/{pin_id}", fields={"code": pin_code})
+    token = str(result.get("authToken") or "")
+    if not token:
+        return {"linked": False, "expired": False, "code": pin_code, "url": link_url(pin_code)}
+    name = ""
+    with contextlib.suppress(PlayerError):
+        user = plex_cloud_request("/user", token=token)
+        name = str(user.get("username") or user.get("title") or user.get("email") or "")
+    save_settings({"accountToken": token, "accountName": name, "accountLinkedAt": int(time.time()),
+                   "pendingLink": None, "lastReconnectAt": None})
+    if load_settings().get("serverId"):
+        with contextlib.suppress(PlayerError, OSError):
+            refresh_server_connection(load_settings())
+    return {"linked": True, "account": name}
+
+
+def link_cancel() -> dict[str, Any]:
+    save_settings({"pendingLink": None})
+    return account_state()
+
+
+def account_state() -> dict[str, Any]:
+    data = load_settings()
+    linked = bool(data.get("accountToken")) or bool(data.get("server") and data.get("token"))
+    configured = bool(data.get("server") and data.get("token"))
+    if configured and data.get("section"):
+        stage = "ready"
+    elif configured:
+        stage = "libraries"
+    elif data.get("accountToken"):
+        stage = "servers"
+    else:
+        stage = "unlinked"
+    pending = data.get("pendingLink") if isinstance(data.get("pendingLink"), dict) else {}
+    return {
+        "linked": linked,
+        "configured": configured,
+        "stage": stage,
+        "account": str(data.get("accountName", "")),
+        "server": str(data.get("server", "")),
+        "serverName": str(data.get("serverName", "")),
+        "library": str(data.get("sectionTitle", "")),
+        "connectionEnabled": connection_enabled(data),
+        "linkPending": bool(pending.get("id")),
+        "linkCode": str(pending.get("code", "")),
+        "linkUrl": link_url(str(pending.get("code", ""))) if pending.get("code") else "",
+    }
+
+
+def connection_score(connection: dict[str, Any]) -> tuple[int, int, int]:
+    return (0 if connection.get("relay") else 1, 1 if connection.get("local") else 0,
+            1 if connection.get("protocol") == "https" else 0)
+
+
+def probe_server(uri: str, token: str, expected_id: str = "") -> bool:
+    request = urllib.request.Request(uri + "/identity", headers={
+        "Accept": "application/json", "X-Plex-Token": token,
+        "X-Plex-Client-Identifier": client_identifier(), "X-Plex-Product": APP_NAME})
+    try:
+        with safe_urlopen(request, timeout=4) as response:
+            payload = response_json(response, PLEX_CLOUD_JSON_MAX_BYTES)
+    except (urllib.error.URLError, TimeoutError, PlayerError, OSError, ValueError):
+        return False
+    container = payload.get("MediaContainer", {})
+    machine = str(container.get("machineIdentifier", "")) if isinstance(container, dict) else ""
+    return not expected_id or not machine or machine == expected_id
+
+
+def discover_servers(account_token: str) -> list[dict[str, Any]]:
+    rows = plex_cloud_request("/resources", fields={"includeHttps": "1", "includeRelay": "1"},
+                              token=account_token, allow_list=True)
+    if not isinstance(rows, list):
+        raise PlayerError("Plex did not list any servers.", "plex-cloud")
+    servers: list[dict[str, Any]] = []
+    probes: list[tuple[int, dict[str, Any]]] = []
+    for row in rows:
+        if not isinstance(row, dict) or "server" not in str(row.get("provides", "")):
+            continue
+        connections = [c for c in row.get("connections", []) if isinstance(c, dict) and c.get("uri")]
+        connections.sort(key=connection_score, reverse=True)
+        token = str(row.get("accessToken") or account_token)
+        server = {
+            "name": str(row.get("name", "Plex server")),
+            "clientIdentifier": str(row.get("clientIdentifier", "")),
+            "owned": bool(row.get("owned")),
+            "version": str(row.get("productVersion", "")),
+            "platform": str(row.get("platform", "")),
+            "online": bool(row.get("presence", True)),
+            "reachable": False,
+            "uri": "",
+            "relay": False,
+            "local": False,
+            "token": token,
+            "connections": [normalize_server_url(str(c["uri"])) for c in connections],
+        }
+        servers.append(server)
+        for connection in connections:
+            probes.append((len(servers) - 1, connection))
+    if probes:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, max(1, len(probes)))) as pool:
+            futures = {pool.submit(probe_server, normalize_server_url(str(c["uri"])), servers[i]["token"],
+                                   servers[i]["clientIdentifier"]): (i, c) for i, c in probes}
+            reachable: dict[int, list[dict[str, Any]]] = {}
+            for future in concurrent.futures.as_completed(futures):
+                index, connection = futures[future]
+                if future.result():
+                    reachable.setdefault(index, []).append(connection)
+        for index, options in reachable.items():
+            options.sort(key=connection_score, reverse=True)
+            best = options[0]
+            servers[index].update({"reachable": True, "uri": normalize_server_url(str(best["uri"])),
+                                   "relay": bool(best.get("relay")), "local": bool(best.get("local"))})
+    servers.sort(key=lambda s: (s["reachable"], s["owned"], s["name"].lower()), reverse=True)
+    return servers
+
+
+def public_servers(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{key: value for key, value in server.items() if key != "token"} for server in servers]
+
+
+def require_account_token() -> str:
+    token = str(load_settings().get("accountToken", ""))
+    if not token:
+        raise PlayerError("Link your Plex account first.", "unlinked")
+    return token
+
+
+def list_servers() -> dict[str, Any]:
+    servers = discover_servers(require_account_token())
+    return {"servers": public_servers(servers), "state": account_state()}
+
+
+def select_server(server_id: str, servers: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    account_token = require_account_token()
+    servers = servers if servers is not None else discover_servers(account_token)
+    match = next((s for s in servers if s["clientIdentifier"] == server_id), None)
+    if match is None:
+        raise PlayerError("That Plex server is not available on this account.", "server-missing")
+    if not match["reachable"]:
+        raise PlayerError(f"{match['name']} is not reachable from this device right now.", "unreachable")
+    previous = load_settings()
+    candidate = {
+        "server": match["uri"],
+        "token": match["token"],
+        "serverName": match["name"],
+        "serverId": match["clientIdentifier"],
+        "clientIdentifier": previous.get("clientIdentifier") or client_identifier(),
+        "accountConnectedAt": int(time.time()),
+    }
+    libraries = sections(candidate)
+    if not libraries:
+        raise PlayerError(f"{match['name']} has no Plex music library.", "no-library")
+    if len(libraries) == 1:
+        candidate.update({"section": libraries[0]["key"], "sectionTitle": libraries[0]["title"]})
+    replace_account(candidate)
+    return {"libraries": libraries, "state": account_state()}
+
+
+def list_libraries() -> dict[str, Any]:
+    config = load_config(include_disabled=True)
+    return {"libraries": sections(config), "state": account_state()}
+
+
+def select_library(key: str) -> dict[str, Any]:
+    config = load_config(include_disabled=True)
+    available = sections(config)
+    chosen = next((row for row in available if row["key"] == str(key)), None)
+    if chosen is None:
+        raise PlayerError("That music library does not exist on the server.", "library-missing")
+    if str(config.get("section", "")) != chosen["key"]:
+        with contextlib.suppress(PlayerError, OSError):
+            shutdown_player(config)
+        secure_unlink(STATE_FILE)
+    save_settings({"section": chosen["key"], "sectionTitle": chosen["title"], "connectionEnabled": True})
+    return {"library": chosen, "state": account_state()}
+
+
+def refresh_server_connection(config: dict[str, Any]) -> bool:
+    """Re-resolve the server address from plex.tv after a connection failure."""
+    settings = load_settings()
+    account_token = str(settings.get("accountToken", ""))
+    server_id = str(settings.get("serverId", ""))
+    if not account_token or not server_id:
+        return False
+    if time.time() - safe_int(settings.get("lastReconnectAt")) < 60:
+        return False
+    save_settings({"lastReconnectAt": int(time.time())})
+    try:
+        servers = discover_servers(account_token)
+    except PlayerError:
+        return False
+    match = next((s for s in servers if s["clientIdentifier"] == server_id and s["reachable"]), None)
+    if match is None:
+        return False
+    changed = match["uri"] != config.get("server") or match["token"] != config.get("token")
+    if changed:
+        save_settings({"server": match["uri"], "token": match["token"]})
+        config.update({"server": match["uri"], "token": match["token"]})
+    return changed
+
+
+def open_in_browser(url: str) -> None:
+    browser = shutil_which("xdg-open")
+    if browser:
+        subprocess.Popen([browser, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def login(server: str, section: str = "", no_browser: bool = False) -> dict[str, Any]:
+    server = normalize_server_url(server) if server else ""
+    started = link_start()
+    print(f"Open this address to link {APP_NAME} (code {started['code']}):\n{started['url']}\n", flush=True)
+    if not no_browser:
+        open_in_browser(started["url"])
+    print("Waiting for Plex sign-in…", flush=True)
+    deadline = time.monotonic() + PLEX_LOGIN_TIMEOUT_SECONDS
+    linked = False
+    while time.monotonic() < deadline:
+        result = link_poll()
+        if result.get("linked"):
+            linked = True
+            break
+        if result.get("expired"):
+            break
+        time.sleep(1)
+    if not linked:
+        link_cancel()
+        raise PlayerError("Plex sign-in timed out. Try again.", "auth-timeout")
+    account_token = require_account_token()
+    if server:
+        candidate = {"server": server, "token": account_token, "clientIdentifier": client_identifier(),
+                     "accountConnectedAt": int(time.time())}
+        choose_music_library(candidate, section, interactive=True)
+        replace_account(candidate)
+        return {"connected": True, "server": server, "library": candidate["sectionTitle"]}
+    servers = discover_servers(account_token)
+    if not servers:
+        raise PlayerError("No Plex Media Server is available on this account.", "server-missing")
+    reachable = [s for s in servers if s["reachable"]]
+    if not reachable:
+        raise PlayerError("None of your Plex servers are reachable from this device.", "unreachable")
+    chosen = reachable[0]
+    if len(reachable) > 1:
+        print("Plex servers:")
+        for index, row in enumerate(reachable, 1):
+            print(f"  {index}. {row['name']} ({row['uri']})")
+        selection = input("Choose a server [1]: ").strip() or "1"
+        try:
+            chosen = reachable[int(selection) - 1]
+        except (ValueError, IndexError) as error:
+            raise PlayerError("Invalid server selection.", "server-missing") from error
+    result = select_server(chosen["clientIdentifier"], servers)
+    libraries = result["libraries"]
+    if len(libraries) > 1:
+        config = load_config(include_disabled=True)
+        choose_music_library(config, section, interactive=True)
+        save_settings({"section": config["section"], "sectionTitle": config["sectionTitle"]})
+    state = account_state()
+    return {"connected": True, "server": state["server"], "serverName": state["serverName"], "library": state["library"]}
+
+
+def logout() -> dict[str, Any]:
+    data = load_settings()
+    with contextlib.suppress(OSError, PlayerError):
+        stop_timeline(data)
+    preserved = {"clientIdentifier": data.get("clientIdentifier") or client_identifier()}
+    atomic_json(CONFIG_FILE, preserved, maximum=CONFIG_MAX_BYTES)
+    secure_unlink(STATE_FILE)
+    try:
+        shutdown_player(data, report_timeline=False)
+        return {"connected": False, "stopped": True}
+    except PlayerError as error:
+        return {"connected": False, "stopped": False, "warning": str(error), "code": error.code}
+
+
+def set_connection(enabled: bool) -> dict[str, Any]:
+    config = load_config(False, include_disabled=True)
+    if not config:
+        raise PlayerError("Connect Plexarchy to Plex first.", "unconfigured")
+    if enabled:
+        config = save_settings({"connectionEnabled": True})
+        config["server"] = normalize_server_url(str(config["server"]))
+        return status(config)
+
+    warnings = []
+    try:
+        stop_timeline(config)
+    except PlayerError as error:
+        warnings.append(str(error))
+    save_settings({"connectionEnabled": False})
+    disabled_config = dict(config)
+    disabled_config["connectionEnabled"] = False
+    try:
+        shutdown_player(disabled_config, report_timeline=False)
+    except PlayerError as error:
+        warnings.append(str(error))
+    result = status(disabled_config)
+    if warnings:
+        result.update({"warning": " ".join(warnings), "code": "player-shutdown"})
+    return result
+
+
+def metadata(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    container = payload.get("MediaContainer", {})
+    rows = container.get("Metadata", []) if isinstance(container, dict) else []
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def sections(config: dict[str, Any]) -> list[dict[str, str]]:
+    container = plex_request(config, "/library/sections").get("MediaContainer", {})
+    rows = container.get("Directory", []) if isinstance(container, dict) else []
+    return [
+        {"key": str(row.get("key", "")), "title": str(row.get("title", "Music"))}
+        for row in rows
+        if isinstance(row, dict) and row.get("type") == "artist" and row.get("key") is not None
+    ]
+
+
+def music_section(config: dict[str, Any]) -> str:
+    configured = str(config.get("section", ""))
+    if configured:
+        return configured
+    available = sections(config)
+    if not available:
+        raise PlayerError("No Plex music library was found.")
+    return available[0]["key"]
+
+
+def cleanup_cache(max_age_days: int = 30, max_bytes: int = CACHE_MAX_BYTES,
+                  temp_grace_seconds: int = ATOMIC_TEMP_GRACE_SECONDS) -> dict[str, int]:
+    now = time.time()
+    candidates: list[tuple[float, int, pathlib.Path]] = []
+    for folder in (ART_CACHE_DIR, DATA_CACHE_DIR):
+        try:
+            with secure_parent_directory(folder / ".scan") as (parent, _):
+                with os.scandir(parent) as entries:
+                    for entry in entries:
+                        try:
+                            info = entry.stat(follow_symlinks=False)
+                            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                                continue
+                            if entry.name.startswith("."):
+                                stale_temp = now - info.st_mtime > temp_grace_seconds
+                                if ATOMIC_TEMP_PATTERN.fullmatch(entry.name) and stale_temp:
+                                    candidates.append((0, info.st_size, folder / entry.name))
+                                continue
+                            if stat.S_ISREG(info.st_mode):
+                                candidates.append((info.st_mtime, info.st_size, folder / entry.name))
+                        except OSError:
+                            continue
+        except FileNotFoundError:
+            continue
+    removed = 0
+    removed_bytes = 0
+    kept: list[tuple[float, int, pathlib.Path]] = []
+    for modified, size, path in candidates:
+        if modified == 0 or now - modified > max_age_days * 86400:
+            try:
+                secure_unlink(path)
+                removed += 1
+                removed_bytes += size
+            except OSError:
+                pass
+        else:
+            kept.append((modified, size, path))
+    total = sum(size for _, size, _ in kept)
+    for modified, size, path in sorted(kept):
+        if total <= max_bytes:
+            break
+        try:
+            secure_unlink(path)
+            total -= size
+            removed += 1
+            removed_bytes += size
+        except OSError:
+            pass
+    return {"removed": removed, "bytes": removed_bytes}
+
+
+def maybe_cleanup_cache(interval_hours: int = 24) -> None:
+    marker = CACHE_DIR / ".last-cleanup"
+    try:
+        marker_info = secure_stat(marker)
+        if marker_info and stat.S_ISREG(marker_info.st_mode) and time.time() - marker_info.st_mtime < interval_hours * 3600:
+            return
+    except (OSError, PlayerError):
+        pass
+    cleanup_cache()
+    try:
+        atomic_bytes(marker, b"", maximum=1)
+    except (OSError, PlayerError):
+        pass
+
+
+def cache_namespace(config: dict[str, Any]) -> str:
+    identity = "\0".join((
+        str(config.get("server", "")).strip().rstrip("/"),
+        str(config.get("section", "")),
+        str(config.get("token", "")),
+    ))
+    return hashlib.sha256(identity.encode()).hexdigest()[:16]
+
+
+def image_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Read common raster dimensions without decoding untrusted image pixels."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return struct.unpack(">II", data[16:24])
+    if data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+        return struct.unpack("<HH", data[6:10])
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP" and len(data) >= 30:
+        kind = data[12:16]
+        if kind == b"VP8X":
+            return (1 + int.from_bytes(data[24:27], "little"),
+                    1 + int.from_bytes(data[27:30], "little"))
+        if kind == b"VP8L" and data[20:21] == b"/" and len(data) >= 25:
+            b1, b2, b3, b4 = data[21:25]
+            return (1 + b1 + ((b2 & 0x3f) << 8),
+                    1 + (b2 >> 6) + (b3 << 2) + ((b4 & 0x0f) << 10))
+        marker = data.find(b"\x9d\x01\x2a", 20)
+        if kind == b"VP8 " and marker >= 0 and marker + 7 <= len(data):
+            return (int.from_bytes(data[marker + 3:marker + 5], "little") & 0x3fff,
+                    int.from_bytes(data[marker + 5:marker + 7], "little") & 0x3fff)
+    if data.startswith(b"\xff\xd8"):
+        offset = 2
+        sof = {0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf}
+        while offset + 4 <= len(data):
+            if data[offset] != 0xff:
+                offset += 1
+                continue
+            while offset < len(data) and data[offset] == 0xff:
+                offset += 1
+            if offset >= len(data):
+                break
+            marker = data[offset]
+            offset += 1
+            if marker in (0x01, *range(0xd0, 0xda)):
+                continue
+            if offset + 2 > len(data):
+                break
+            length = int.from_bytes(data[offset:offset + 2], "big")
+            if length < 2 or offset + length > len(data):
+                break
+            if marker in sof and length >= 7:
+                return (int.from_bytes(data[offset + 5:offset + 7], "big"),
+                        int.from_bytes(data[offset + 3:offset + 5], "big"))
+            offset += length
+    return None
+
+
+def valid_image_payload(data: bytes) -> bool:
+    dimensions = image_dimensions(data[:256 * 1024])
+    if not dimensions:
+        return False
+    width, height = dimensions
+    structurally_complete = (
+        (data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9"))
+        or (data.startswith(b"\x89PNG\r\n\x1a\n") and data.endswith(b"IEND\xaeB\x60\x82"))
+        or (data[:6] in (b"GIF87a", b"GIF89a") and data.endswith(b";"))
+        or (data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+            and len(data) >= 12 and int.from_bytes(data[4:8], "little") + 8 == len(data))
+    )
+    return structurally_complete and 0 < width <= ART_MAX_DIMENSION and 0 < height <= ART_MAX_DIMENSION \
+        and width * height <= ART_MAX_PIXELS
+
+
+def cached_art_payload(target: pathlib.Path) -> bytes:
+    with secure_parent_directory(target) as (parent, filename):
+        descriptor = os.open(filename, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            details = os.fstat(descriptor)
+            if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid() \
+                    or stat.S_IMODE(details.st_mode) != 0o600 or not 0 < details.st_size <= ART_MAX_BYTES:
+                return b""
+            payload = bytearray()
+            while len(payload) < details.st_size:
+                chunk = os.read(descriptor, min(65536, details.st_size - len(payload)))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            return bytes(payload)
+        finally:
+            os.close(descriptor)
+
+
+def valid_cached_art(target: pathlib.Path) -> bool:
+    target_info = secure_stat(target)
+    if not (target_info and stat.S_ISREG(target_info.st_mode) and target_info.st_uid == os.geteuid()
+            and stat.S_IMODE(target_info.st_mode) == 0o600 and 0 < target_info.st_size <= ART_MAX_BYTES):
+        return False
+    try:
+        return valid_image_payload(cached_art_payload(target))
+    except (OSError, PlayerError):
+        return False
+
+
+@contextlib.contextmanager
+def art_cache_lock() -> Any:
+    lock_file = ART_CACHE_DIR.parent / ".art-cache.lock"
+    with ART_CACHE_LOCK, secure_parent_directory(lock_file, create=True) as (parent, filename):
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+        descriptor = os.open(filename, flags, 0o600, dir_fd=parent)
+        try:
+            details = os.fstat(descriptor)
+            if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid() \
+                    or stat.S_IMODE(details.st_mode) != 0o600:
+                raise PlayerError("The artwork cache lock is unsafe.", "local-security")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
+def art_path(config: dict[str, Any], source: str | None) -> str:
+    if not source or not source.startswith("/") or source.startswith("//"):
+        return ""
+    ensure_private_dir(ART_CACHE_DIR)
+    digest = hashlib.sha256(f"{cache_namespace(config)}\0{source}".encode()).hexdigest()[:24]
+    target = ART_CACHE_DIR / f"{digest}.jpg"
+    if valid_cached_art(target):
+        try:
+            secure_utime(target)
+        except OSError:
+            pass
+        return target.as_uri()
+    with contextlib.suppress(OSError, PlayerError):
+        secure_unlink(target)
+    url = config["server"] + source
+    request = urllib.request.Request(url, headers={"X-Plex-Token": str(config["token"])})
+    try:
+        with safe_urlopen(request, timeout=8) as response:
+            data = response.read(ART_MAX_BYTES + 1)
+        if data and len(data) <= ART_MAX_BYTES and valid_image_payload(data):
+            with art_cache_lock():
+                if not valid_cached_art(target):
+                    atomic_bytes(target, data, maximum=ART_MAX_BYTES)
+                cleanup_cache(max_bytes=CACHE_MAX_BYTES)
+            return target.as_uri() if valid_cached_art(target) else ""
+    except (OSError, PlayerError, urllib.error.URLError, TimeoutError):
+        pass
+    return ""
+
+
+def compact_item(config: dict[str, Any], row: dict[str, Any], fetch_art: bool = True) -> dict[str, Any]:
+    kind = str(row.get("type", ""))
+    art_source = str(row.get("thumb") or row.get("parentThumb") or row.get("grandparentThumb") or "")
+    return {
+        "key": str(row.get("ratingKey", row.get("key", ""))),
+        "type": kind,
+        "title": str(row.get("title", "Untitled")),
+        "artist": str(row.get("grandparentTitle", row.get("parentTitle", row.get("title", ""))) if kind == "artist" else row.get("grandparentTitle", row.get("parentTitle", ""))),
+        "album": str(row.get("parentTitle", "") if kind == "track" else row.get("title", "")),
+        "year": safe_int(row.get("year", 0)),
+        "duration": safe_float(row.get("duration", 0)) / 1000,
+        "thumb": art_path(config, art_source) if fetch_art else "",
+        "artSource": art_source,
+        "index": safe_int(row.get("index", 0)),
+        "leafCount": safe_int(row.get("leafCount", 0)),
+        "viewCount": safe_int(row.get("viewCount", 0)),
+    }
+
+
+def compact_items(config: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [compact_item(config, row, fetch_art=False) for row in rows]
+
+
+def compact_playback_item(config: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    item = compact_item(config, row, fetch_art=False)
+    source = str(item.pop("artSource", ""))
+    if source:
+        item["_artSource"] = source
+    return item
+
+
+def compact_playback_items(config: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prepare queue metadata without delaying playback for cover downloads."""
+    return [compact_playback_item(config, row) for row in rows]
+
+
+def data_cache_path(config: dict[str, Any], name: str) -> pathlib.Path:
+    digest = hashlib.sha256(f"{cache_namespace(config)}\0{name}".encode()).hexdigest()[:24]
+    return DATA_CACHE_DIR / f"{digest}.json"
+
+
+def cached_items(config: dict[str, Any], name: str, loader: Any) -> dict[str, Any]:
+    target = data_cache_path(config, name)
+    try:
+        items = loader()
+        payload = {"items": items, "stale": False, "cachedAt": int(time.time())}
+        atomic_json(target, payload, maximum=DATA_MAX_BYTES)
+        cleanup_cache(max_bytes=CACHE_MAX_BYTES)
+        return payload
+    except PlayerError as error:
+        cached = load_json(target, {}, DATA_MAX_BYTES)
+        if error.code in ("unreachable", "dns", "timeout") and isinstance(cached, dict) and cached.get("items"):
+            cached["stale"] = True
+            cached["warning"] = str(error)
+            return cached
+        raise
+
+
+def recent(config: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+    section = music_section(config)
+    payload = plex_request(config, f"/library/sections/{section}/recentlyAdded", {
+        "type": 9,
+        "X-Plex-Container-Start": 0,
+        "X-Plex-Container-Size": max(5, min(limit, 50)),
+    })
+    return compact_items(config, [row for row in metadata(payload) if row.get("type") == "album"])
+
+
+def album_track_rows(config: dict[str, Any], album_key: str) -> list[dict[str, Any]]:
+    payload = plex_request(config, f"/library/metadata/{urllib.parse.quote(album_key)}/children")
+    return [row for row in metadata(payload) if row.get("type") == "track"]
+
+
+def album_tracks(config: dict[str, Any], album_key: str) -> list[dict[str, Any]]:
+    return compact_items(config, album_track_rows(config, album_key))
+
+
+def artist_albums(config: dict[str, Any], artist_key: str) -> list[dict[str, Any]]:
+    payload = plex_request(config, f"/library/metadata/{urllib.parse.quote(artist_key)}/children")
+    return compact_items(config, [row for row in metadata(payload) if row.get("type") == "album"])
+
+
+def playlist_track_rows(config: dict[str, Any], playlist_key: str) -> list[dict[str, Any]]:
+    payload = plex_request(config, f"/playlists/{urllib.parse.quote(playlist_key)}/items")
+    return [row for row in metadata(payload) if row.get("type") == "track"]
+
+
+def playlist_tracks(config: dict[str, Any], playlist_key: str) -> list[dict[str, Any]]:
+    return compact_items(config, playlist_track_rows(config, playlist_key))
+
+
+def library_list(config: dict[str, Any], view: str, limit: int) -> list[dict[str, Any]]:
+    section = music_section(config)
+    size = max(5, min(limit, 250))
+    if view == "artists":
+        path, params, accepted = f"/library/sections/{section}/all", {"type": 8, "sort": "titleSort", "X-Plex-Container-Size": size}, ("artist",)
+    elif view == "albums":
+        path, params, accepted = f"/library/sections/{section}/all", {"type": 9, "sort": "titleSort", "X-Plex-Container-Size": size}, ("album",)
+    elif view == "playlists":
+        path, params, accepted = "/playlists", {"playlistType": "audio", "X-Plex-Container-Size": size}, ("playlist",)
+    elif view == "history":
+        path, params, accepted = "/status/sessions/history/all", {"librarySectionID": section, "sort": "viewedAt:desc", "X-Plex-Container-Size": size}, ("track",)
+    elif view == "favorites":
+        path, params, accepted = f"/library/sections/{section}/all", {"type": 10, "userRating>=": 9, "sort": "titleSort", "X-Plex-Container-Size": size}, ("track",)
+    elif view == "frequent":
+        path, params, accepted = f"/library/sections/{section}/all", {"type": 10, "sort": "viewCount:desc", "X-Plex-Container-Size": size}, ("track",)
+    else:
+        return recent(config, size)
+    rows = metadata(plex_request(config, path, params))
+    if view == "favorites":
+        rows = [row for row in rows if safe_float(row.get("userRating", 0)) >= 9]
+    return compact_items(config, [row for row in rows if row.get("type") in accepted][:size])
+
+
+def search(config: dict[str, Any], query: str, limit: int) -> list[dict[str, Any]]:
+    if len(query) > SEARCH_QUERY_MAX_CHARS:
+        raise PlayerError(f"Search queries are limited to {SEARCH_QUERY_MAX_CHARS} characters.", "invalid-query")
+    section = music_section(config)
+    payload = plex_request(config, "/hubs/search", {
+        "query": query,
+        "sectionId": section,
+        "limit": max(5, min(limit, 50)),
+        "includeCollections": 0,
+    })
+    container = payload.get("MediaContainer", {})
+    hubs = container.get("Hub", []) if isinstance(container, dict) else []
+    rows: list[dict[str, Any]] = []
+    for hub in hubs if isinstance(hubs, list) else []:
+        hub_rows = hub.get("Metadata", []) if isinstance(hub, dict) else []
+        for row in hub_rows if isinstance(hub_rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            if row.get("type") in ("album", "track"):
+                rows.append(row)
+                if len(rows) >= limit:
+                    return compact_items(config, rows)
+    return compact_items(config, rows)
+
+
+def media_part(row: dict[str, Any]) -> str:
+    media = row.get("Media", [])
+    parts = media[0].get("Part", []) if isinstance(media, list) and media and isinstance(media[0], dict) else []
+    return str(parts[0].get("key", "")) if parts and isinstance(parts[0], dict) else ""
+
+
+def raw_track(config: dict[str, Any], key: str) -> tuple[dict[str, Any], str]:
+    rows = metadata(plex_request(config, f"/library/metadata/{urllib.parse.quote(key)}"))
+    if not rows:
+        raise PlayerError("The selected track no longer exists in Plex.")
+    row = rows[0]
+    part = media_part(row)
+    if not part:
+        raise PlayerError("Plex did not provide a playable file for this track.")
+    return compact_playback_item(config, row), part
+
+
+def mpv_commands(commands: list[list[Any]]) -> list[Any]:
+    requests = [
+        {"command": command, "request_id": index + 1}
+        for index, command in enumerate(commands)
+    ]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(1.0)
+        client.connect(str(SOCKET_FILE))
+        client.sendall(b"".join((json.dumps(request) + "\n").encode() for request in requests))
+        buffer = bytearray()
+        responses: dict[int, Any] = {}
+        received = 0
+        while len(responses) < len(requests):
+            chunk = client.recv(min(65536, MPV_REPLY_MAX_BYTES + 1 - received))
+            if not chunk:
+                raise PlayerError("mpv closed its IPC connection without a reply.", "player-ipc")
+            received += len(chunk)
+            if received > MPV_REPLY_MAX_BYTES:
+                raise PlayerError("mpv returned an oversized IPC reply.", "player-ipc")
+            buffer.extend(chunk)
+            while b"\n" in buffer:
+                line, _, remainder = buffer.partition(b"\n")
+                buffer = bytearray(remainder)
+                try:
+                    response = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise PlayerError("mpv returned an invalid IPC reply.", "player-ipc") from error
+                if not isinstance(response, dict):
+                    raise PlayerError("mpv returned an invalid IPC reply.", "player-ipc")
+                request_id = safe_int(response.get("request_id"), -1)
+                if request_id not in range(1, len(requests) + 1):
+                    continue
+                if response.get("error") != "success":
+                    raise PlayerError(f"mpv: {response.get('error', 'unknown error')}", "player-ipc")
+                responses[request_id] = response.get("data")
+        return [responses[index + 1] for index in range(len(requests))]
+
+
+def mpv_command(command: list[Any], expect_reply: bool = False) -> Any:
+    if expect_reply:
+        return mpv_commands([command])[0]
+    request = {"command": command}
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(1.0)
+        client.connect(str(SOCKET_FILE))
+        client.sendall((json.dumps(request) + "\n").encode())
+    return None
+
+
+def mpv_properties(names: list[str]) -> dict[str, Any] | None:
+    socket_info = secure_stat(SOCKET_FILE)
+    if socket_info is None:
+        return None
+    if not stat.S_ISSOCK(socket_info.st_mode) or socket_info.st_uid != os.geteuid():
+        secure_unlink(SOCKET_FILE)
+        return None
+    try:
+        values = mpv_commands([["get_property", name] for name in names])
+        return dict(zip(names, values))
+    except (OSError, PlayerError, json.JSONDecodeError):
+        return None
+
+
+def mpv_running() -> bool:
+    return mpv_properties(["idle-active"]) is not None
+
+
+def recover_stale_mpv_socket() -> None:
+    socket_info = secure_stat(SOCKET_FILE)
+    if socket_info is None:
+        return
+    if not stat.S_ISSOCK(socket_info.st_mode) or socket_info.st_uid != os.geteuid():
+        secure_unlink(SOCKET_FILE)
+        return
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(0.25)
+            client.connect(str(SOCKET_FILE))
+    except (ConnectionRefusedError, FileNotFoundError):
+        secure_unlink(SOCKET_FILE)
+        return
+    except OSError as error:
+        raise PlayerError("The existing Plexarchy player is not responding.", "player-ipc") from error
+    raise PlayerError("The existing Plexarchy player is not responding.", "player-ipc")
+
+
+def start_mpv() -> None:
+    if mpv_running():
+        return
+    recover_stale_mpv_socket()
+    executable = shutil_which("mpv")
+    if not executable:
+        raise PlayerError("mpv is required. Install it with: omarchy pkg add mpv")
+    ensure_private_dir(CACHE_DIR)
+    arguments = [executable, "--idle=yes", "--no-video", "--audio-display=no", "--keep-open=no",
+                 "--title=Plexarchy", "--audio-client-name=Plexarchy",
+                 f"--input-ipc-server={SOCKET_FILE}", "--terminal=no"]
+    mpris = mpris_script_path()
+    if mpris:
+        arguments.append(f"--script={mpris}")
+    process = subprocess.Popen(
+        arguments,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    for _ in range(30):
+        if mpv_running():
+            return
+        time.sleep(0.05)
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        process.terminate()
+        process.wait(timeout=0.5)
+    if process.poll() is None:
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            process.kill()
+            process.wait(timeout=0.5)
+    with contextlib.suppress(OSError, PlayerError):
+        secure_unlink(SOCKET_FILE)
+    raise PlayerError("mpv did not start.")
+
+
+def mpris_script_path() -> str:
+    """Return an mpv-mpris plugin path that mpv would not already auto-load."""
+    if pathlib.Path("/etc/mpv/scripts/mpris.so").is_file():
+        return ""
+    for candidate in ("/usr/lib/mpv-mpris/mpris.so", "/usr/lib64/mpv-mpris/mpris.so",
+                      "/usr/lib/x86_64-linux-gnu/mpv-mpris/mpris.so", "/usr/lib/mpv/scripts/mpris.so"):
+        if pathlib.Path(candidate).is_file():
+            return candidate
+    return ""
+
+
+def shutil_which(name: str) -> str | None:
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if not folder or not os.path.isabs(folder):
+            continue
+        candidate = pathlib.Path(folder) / name
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved.is_file() and os.access(resolved, os.X_OK):
+            return str(resolved)
+    return None
+
+
+def stream_url(config: dict[str, Any], part: str) -> str:
+    return config["server"] + part
+
+
+LOADFILE_INDEX_SUPPORTED: bool | None = None
+
+
+def loadfile_supports_index() -> bool:
+    """mpv 0.38 added the <index> argument to loadfile; older builds reject it."""
+    global LOADFILE_INDEX_SUPPORTED
+    if LOADFILE_INDEX_SUPPORTED is None:
+        supported = True
+        try:
+            version = str(mpv_commands([["get_property", "mpv-version"]])[0])
+            match = re.search(r"(\d+)\.(\d+)", version)
+            if match:
+                supported = (int(match.group(1)), int(match.group(2))) >= (0, 38)
+        except (OSError, PlayerError, ValueError):
+            pass
+        LOADFILE_INDEX_SUPPORTED = supported
+    return LOADFILE_INDEX_SUPPORTED
+
+
+def loadfile_command(url: str, mode: str, options: dict[str, str]) -> list[Any]:
+    if loadfile_supports_index():
+        return ["loadfile", url, mode, -1, options]
+    return ["loadfile", url, mode, options]
+
+
+def load_stream(config: dict[str, Any], url: str, mode: str) -> None:
+    options = {"http-header-fields": f"X-Plex-Token: {config['token']}"}
+    mpv_command(loadfile_command(url, mode, options), True)
+
+
+def load_streams(config: dict[str, Any], urls: list[str]) -> None:
+    options = {"http-header-fields": f"X-Plex-Token: {config['token']}"}
+    commands = [
+        loadfile_command(url, "replace" if index == 0 else "append", options)
+        for index, url in enumerate(urls)
+    ]
+    if commands:
+        mpv_commands(commands)
+
+
+def state_data() -> dict[str, Any]:
+    state = load_json(STATE_FILE, {}, STATE_MAX_BYTES)
+    if not isinstance(state, dict):
+        state = {}
+    state.setdefault("queue", [])
+    state.setdefault("shuffle", False)
+    state.setdefault("repeat", "off")
+    state.setdefault("volume", 100)
+    return state
+
+
+def state_for_config(config: dict[str, Any], state: dict[str, Any] | None = None) -> dict[str, Any]:
+    candidate = state if isinstance(state, dict) else state_data()
+    namespace = str(candidate.get("queueNamespace", ""))
+    if not config or not namespace or namespace != cache_namespace(config):
+        fresh = {"queue": [], "shuffle": False, "repeat": "off", "volume": 100}
+        if config:
+            fresh["queueNamespace"] = cache_namespace(config)
+        return fresh
+    return candidate
+
+
+@contextlib.contextmanager
+def state_lock() -> Any:
+    lock_path = STATE_FILE.with_name(STATE_FILE.name + ".lock")
+    with secure_parent_directory(lock_path, create=True) as (parent, filename):
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            descriptor = os.open(filename, flags, 0o600, dir_fd=parent)
+        except OSError as error:
+            raise PlayerError("The player state lock could not be opened safely.", "local-security") from error
+        try:
+            details = os.fstat(descriptor)
+            if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid() or stat.S_IMODE(details.st_mode) != 0o600:
+                raise PlayerError("The player state lock is unsafe.", "local-security")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+@contextlib.contextmanager
+def player_lock() -> Any:
+    """Serialize mpv mutations without blocking read-only state/status calls."""
+    lock_path = STATE_FILE.with_name("player.lock")
+    with secure_parent_directory(lock_path, create=True) as (parent, filename):
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            descriptor = os.open(filename, flags, 0o600, dir_fd=parent)
+        except OSError as error:
+            raise PlayerError("The player transaction lock could not be opened safely.", "local-security") from error
+        try:
+            details = os.fstat(descriptor)
+            if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid() \
+                    or stat.S_IMODE(details.st_mode) != 0o600:
+                raise PlayerError("The player transaction lock is unsafe.", "local-security")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def save_state_unlocked(state: dict[str, Any]) -> None:
+    state["updated"] = int(time.time())
+    atomic_json(STATE_FILE, state, maximum=STATE_MAX_BYTES)
+
+
+def queue_revision(state: dict[str, Any]) -> str:
+    relevant = {
+        "queue": state.get("queue", []),
+        "shuffle": bool(state.get("shuffle")),
+        "repeat": str(state.get("repeat", "off")),
+        "queueNamespace": str(state.get("queueNamespace", "")),
+    }
+    return hashlib.sha256(json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def timeline_headers(config: dict[str, Any], session_identifier: str) -> dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "X-Plex-Token": str(config["token"]),
+        "X-Plex-Client-Identifier": str(config.get("clientIdentifier") or client_identifier()),
+        "X-Plex-Session-Identifier": session_identifier,
+        "X-Plex-Product": APP_NAME,
+        "X-Plex-Version": APP_VERSION,
+        "X-Plex-Platform": "Linux",
+        "X-Plex-Device": "PC",
+        "X-Plex-Device-Name": APP_NAME,
+        "X-Plex-Model": "Omarchy bar plugin",
+        "X-Plex-Provides": "player",
+    }
+
+
+def send_timeline(config: dict[str, Any], report: dict[str, Any]) -> bool:
+    """Best-effort Plex Dashboard reporting; reporting must never break playback."""
+    track_key = str(report.get("trackKey", ""))
+    session_identifier = str(report.get("sessionId", ""))
+    if not connection_enabled(config) or not config.get("server") or not config.get("token") \
+            or not track_key or not session_identifier:
+        return False
+    position_ms = max(0, safe_int(report.get("positionMs")))
+    duration_ms = max(0, safe_int(report.get("durationMs")))
+    params = {
+        "ratingKey": track_key,
+        "key": f"/library/metadata/{track_key}",
+        "identifier": "com.plexapp.plugins.library",
+        "state": str(report.get("state", "stopped")),
+        "time": position_ms,
+        "playbackTime": position_ms,
+        "duration": duration_ms,
+    }
+    url = str(config["server"]).rstrip("/") + "/:/timeline?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(
+        url,
+        headers=timeline_headers(config, session_identifier),
+        data=b"",
+        method="POST",
+    )
+    try:
+        with safe_urlopen(request, timeout=1) as response:
+            return 200 <= int(response.status) < 300
+    except (OSError, PlayerError, urllib.error.URLError, TimeoutError):
+        return False
+
+
+def update_timeline(config: dict[str, Any], snapshot: dict[str, Any], force: bool = False) -> None:
+    if not connection_enabled(config) or not config.get("server") or not config.get("token"):
+        return
+    track = snapshot.get("track") if isinstance(snapshot.get("track"), dict) else None
+    track_key = str(track.get("key", "")) if track else ""
+    playback_state = "playing" if snapshot.get("playing") else ("paused" if snapshot.get("paused") else "stopped")
+    position_ms = max(0, round(float(snapshot.get("position", 0) or 0) * 1000))
+    duration_ms = max(0, round(float(snapshot.get("duration", 0) or 0) * 1000))
+    now = time.time()
+    reports: list[dict[str, Any]] = []
+
+    with state_lock():
+        state = state_for_config(config)
+        active = state.get("timeline") if isinstance(state.get("timeline"), dict) else None
+        dirty = False
+
+        if active and (str(active.get("trackKey", "")) != track_key or playback_state == "stopped"):
+            stopped = dict(active)
+            stopped["state"] = "stopped"
+            if str(active.get("trackKey", "")) == track_key:
+                stopped["positionMs"] = position_ms
+                stopped["durationMs"] = duration_ms
+            reports.append(stopped)
+            active = None
+            state.pop("timeline", None)
+            dirty = True
+
+        if track_key and playback_state != "stopped":
+            if active is None:
+                if playback_state == "playing":
+                    active = {
+                        "sessionId": str(uuid.uuid4()),
+                        "trackKey": track_key,
+                        "state": playback_state,
+                        "positionMs": position_ms,
+                        "durationMs": duration_ms,
+                        "lastAttemptAt": 0,
+                    }
+            if active is not None:
+                state_changed = str(active.get("state", "")) != playback_state
+                due = now - safe_float(active.get("lastAttemptAt")) >= TIMELINE_INTERVAL_SECONDS
+                if force or state_changed or due:
+                    active.update({
+                        "trackKey": track_key,
+                        "state": playback_state,
+                        "positionMs": position_ms,
+                        "durationMs": duration_ms,
+                    })
+                    active["lastAttemptAt"] = now
+                    reports.append(dict(active))
+                    state["timeline"] = active
+                    dirty = True
+
+        if dirty:
+            save_state_unlocked(state)
+
+    for report in reports:
+        send_timeline(config, report)
+
+
+def stop_timeline(config: dict[str, Any]) -> None:
+    if not connection_enabled(config) or not config.get("server") or not config.get("token"):
+        return
+    report = None
+    with state_lock():
+        state = state_for_config(config)
+        active = state.pop("timeline", None)
+        if isinstance(active, dict):
+            report = dict(active)
+            report["state"] = "stopped"
+            save_state_unlocked(state)
+    if report:
+        send_timeline(config, report)
+
+
+def shutdown_player(config: dict[str, Any] | None = None, report_timeline: bool = True) -> dict[str, bool]:
+    if config is None:
+        config = load_config(False, include_disabled=True)
+    if report_timeline and connection_enabled(config):
+        stop_timeline(config)
+    if not mpv_running():
+        return {"stopped": True}
+    try:
+        mpv_command(["quit"])
+    except OSError as error:
+        if mpv_running():
+            raise PlayerError("mpv could not be stopped.", "player-shutdown") from error
+    for _ in range(40):
+        if not mpv_running():
+            return {"stopped": True}
+        time.sleep(0.05)
+    raise PlayerError("mpv did not stop in time.", "player-shutdown")
+
+
+def public_item(item: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    visible = {key: value for key, value in item.items() if not key.startswith("_")}
+    if not visible.get("thumb") and item.get("_artSource"):
+        visible["artSource"] = str(item["_artSource"])
+    return visible
+
+
+def reconcile_queue(queue: list[dict[str, Any]], playlist: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_hash: dict[str, collections.deque[dict[str, Any]]] = collections.defaultdict(collections.deque)
+    for item in queue:
+        if isinstance(item, dict) and item.get("_streamHash"):
+            by_hash[str(item["_streamHash"])].append(item)
+    reordered = []
+    for entry in playlist:
+        if not isinstance(entry, dict):
+            continue
+        digest = hashlib.sha256(str(entry.get("filename", "")).encode()).hexdigest()
+        if by_hash[digest]:
+            reordered.append(by_hash[digest].popleft())
+    return reordered
+
+
+def sync_queue_from_mpv(config: dict[str, Any] | None = None,
+                        playlist: list[dict[str, Any]] | None = None,
+                        running: bool | None = None) -> dict[str, Any]:
+    config = config if config is not None else load_config(False)
+    with state_lock():
+        state = state_for_config(config)
+        is_running = mpv_running() if running is None else running
+        if not is_running:
+            return state
+        if playlist is None:
+            playlist = property_or("playlist", [])
+        queue = state.get("queue", [])
+        if not isinstance(playlist, list) or not isinstance(queue, list):
+            return state
+        reordered = reconcile_queue(queue, playlist)
+        if reordered and (len(reordered) != len(queue) or any(a is not b for a, b in zip(reordered, queue))):
+            state["queue"] = reordered
+            save_state_unlocked(state)
+        return state
+
+
+def finish_prepared_item(config: dict[str, Any], item: dict[str, Any], part: str) -> tuple[dict[str, Any], str]:
+    prepared = dict(item)
+    prepared["_part"] = part
+    url = stream_url(config, part)
+    prepared["_streamHash"] = hashlib.sha256(url.encode()).hexdigest()
+    return prepared, url
+
+
+def prepare_rows(config: dict[str, Any], rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    items = compact_playback_items(config, rows)
+    parts = [media_part(row) for row in rows]
+    missing = [index for index, part in enumerate(parts) if not part]
+    if missing:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(missing))) as executor:
+            resolved = list(executor.map(lambda index: raw_track(config, items[index]["key"]), missing))
+        for index, (item, part) in zip(missing, resolved):
+            items[index] = item
+            parts[index] = part
+    prepared = [finish_prepared_item(config, item, part) for item, part in zip(items, parts)]
+    return [item for item, _ in prepared], [url for _, url in prepared]
+
+
+def prepare_collection(config: dict[str, Any], kind: str, key: str,
+                       selected_key: str = "", shuffle: bool = False) -> tuple[list[dict[str, Any]], list[str]]:
+    rows = album_track_rows(config, key) if kind == "album" else playlist_track_rows(config, key)
+    if not rows:
+        raise PlayerError("This collection has no playable tracks.", "empty-collection")
+    selected = next((index for index, row in enumerate(rows)
+                     if str(row.get("ratingKey", row.get("key", ""))) == selected_key), 0)
+    rows = [*rows[selected:], *rows[:selected]][:PLAYBACK_QUEUE_MAX_ITEMS]
+    queue, urls = prepare_rows(config, rows)
+    if shuffle and len(queue) > 1:
+        combined = list(zip(queue[1:], urls[1:]))
+        random.SystemRandom().shuffle(combined)
+        queue = [queue[0], *(item for item, _ in combined)]
+        urls = [urls[0], *(url for _, url in combined)]
+    return queue, urls
+
+
+def prepare_saved_queue(config: dict[str, Any], stored: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    queue = [dict(item) for item in stored[:PLAYBACK_QUEUE_MAX_ITEMS]
+             if isinstance(item, dict) and item.get("key")]
+    missing = [index for index, item in enumerate(queue) if not item.get("_part")]
+    if missing:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(missing))) as executor:
+            resolved = list(executor.map(lambda index: raw_track(config, str(queue[index]["key"])), missing))
+        for index, (item, part) in zip(missing, resolved):
+            queue[index] = item
+            queue[index]["_part"] = part
+    prepared = [finish_prepared_item(config, item, str(item["_part"])) for item in queue]
+    return [item for item, _ in prepared], [url for _, url in prepared]
+
+
+def player_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    snapshot = mpv_properties(["playlist", "playlist-pos", "pause", "loop-file", "loop-playlist"])
+    if snapshot is None:
+        return {"running": False}
+    playlist = snapshot["playlist"]
+    allowed = {str(item.get("_streamHash", "")) for item in state.get("queue", []) if isinstance(item, dict)}
+    urls = [str(entry.get("filename", "")) for entry in playlist if isinstance(entry, dict)] if isinstance(playlist, list) else []
+    if any(hashlib.sha256(url.encode()).hexdigest() not in allowed for url in urls):
+        urls = []
+    return {
+        "running": True,
+        "urls": urls,
+        "position": safe_int(snapshot["playlist-pos"]),
+        "paused": bool(snapshot["pause"]),
+        "loopFile": snapshot["loop-file"] or "no",
+        "loopPlaylist": snapshot["loop-playlist"] or "no",
+    }
+
+
+def restore_player(config: dict[str, Any], snapshot: dict[str, Any]) -> None:
+    try:
+        if not snapshot.get("running"):
+            mpv_command(["quit"])
+            return
+        urls = snapshot.get("urls", [])
+        if not urls:
+            mpv_command(["stop"], True)
+            return
+        load_streams(config, [str(url) for url in urls])
+        mpv_command(["set_property", "playlist-pos", int(snapshot.get("position", 0))], True)
+        mpv_command(["set_property", "pause", bool(snapshot.get("paused"))], True)
+        mpv_command(["set_property", "loop-file", snapshot.get("loopFile", "no")], True)
+        mpv_command(["set_property", "loop-playlist", snapshot.get("loopPlaylist", "no")], True)
+    except (OSError, PlayerError, json.JSONDecodeError):
+        with contextlib.suppress(OSError, PlayerError):
+            mpv_command(["stop"])
+
+
+def activate_queue(config: dict[str, Any], queue: list[dict[str, Any]], urls: list[str],
+                   shuffle: bool, repeat: str | None = None,
+                   expected_revision: str | None = None) -> dict[str, Any]:
+    if not queue or len(queue) != len(urls):
+        raise PlayerError("The playback queue could not be prepared.", "invalid-queue")
+    with player_lock():
+        with state_lock():
+            old_state = state_for_config(config)
+            if expected_revision is not None and queue_revision(old_state) != expected_revision:
+                raise PlayerError("The playback queue changed while it was being prepared.", "queue-changed")
+            candidate = dict(old_state)
+            candidate.update({
+                "queue": queue,
+                "shuffle": shuffle,
+                "queueNamespace": cache_namespace(config),
+                "updated": int(time.time()),
+            })
+            if repeat is not None:
+                candidate["repeat"] = repeat
+            json_bytes(candidate, STATE_MAX_BYTES)
+        snapshot = player_snapshot(old_state)
+        try:
+            start_mpv()
+            load_streams(config, urls)
+            mode = str(candidate.get("repeat", "off"))
+            mpv_command(["set_property", "loop-file", "inf" if mode == "one" else "no"], True)
+            mpv_command(["set_property", "loop-playlist", "inf" if mode == "all" else "no"], True)
+            mpv_command(["set_property", "volume", max(0, min(130, safe_float(candidate.get("volume"), 100)))], True)
+            mpv_command(["set_property", "pause", False], True)
+            mpv_command(["set_property", "playlist-pos", 0], True)
+            with state_lock():
+                current = state_for_config(config)
+                if expected_revision is not None and queue_revision(current) != expected_revision:
+                    raise PlayerError("The playback queue changed while it was being prepared.", "queue-changed")
+                next_state = dict(current)
+                next_state.update({
+                    "queue": queue,
+                    "shuffle": shuffle,
+                    "queueNamespace": cache_namespace(config),
+                    "updated": int(time.time()),
+                })
+                if repeat is not None:
+                    next_state["repeat"] = repeat
+                atomic_bytes(STATE_FILE, json_bytes(next_state, STATE_MAX_BYTES), maximum=STATE_MAX_BYTES)
+        except Exception:
+            restore_player(config, snapshot)
+            raise
+    return status(config, force_timeline=True)
+
+
+def play(config: dict[str, Any], track_key: str, album_key: str | None,
+         playlist_key: str | None = None, shuffle: bool = False) -> dict[str, Any]:
+    if album_key or playlist_key:
+        kind, key = ("album", album_key) if album_key else ("playlist", playlist_key)
+        queue, urls = prepare_collection(config, kind, str(key), track_key, shuffle)
+    else:
+        item, part = raw_track(config, track_key)
+        prepared, url = finish_prepared_item(config, item, part)
+        queue, urls = [prepared], [url]
+    return activate_queue(config, queue, urls, shuffle)
+
+
+def play_collection(config: dict[str, Any], kind: str, key: str, shuffle: bool = False) -> dict[str, Any]:
+    queue, urls = prepare_collection(config, kind, key, shuffle=shuffle)
+    return activate_queue(config, queue, urls, shuffle)
+
+
+def resume_queue(config: dict[str, Any]) -> dict[str, Any]:
+    with state_lock():
+        state = state_for_config(config)
+        stored = state.get("queue", [])
+        revision = queue_revision(state)
+    if not config or not isinstance(stored, list) or not stored:
+        return status(config)
+    queue, urls = prepare_saved_queue(config, stored)
+    return activate_queue(config, queue, urls, bool(state.get("shuffle")),
+                          str(state.get("repeat", "off")), revision)
+
+
+def queue_view(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = config if config is not None else load_config(False)
+    snapshot = mpv_properties(["playlist", "playlist-pos"])
+    state = sync_queue_from_mpv(config, snapshot.get("playlist") if snapshot else None, snapshot is not None)
+    queue = state.get("queue", [])
+    index = safe_int(snapshot.get("playlist-pos")) if snapshot else -1
+    items = []
+    for position, item in enumerate(queue if isinstance(queue, list) else []):
+        visible = public_item(item) or {}
+        visible.update({"queueIndex": position, "current": position == index, "played": position < index})
+        items.append(visible)
+    return {"items": items, "currentIndex": index, "shuffle": bool(state.get("shuffle")), "repeat": state.get("repeat", "off")}
+
+
+def stopped_queue_action(action: str, index: int | None, track_key: str) -> dict[str, Any]:
+    config = load_config()
+    with state_lock():
+        state = state_for_config(config)
+        stored = state.get("queue", [])
+        revision = queue_revision(state)
+    queue = list(stored) if isinstance(stored, list) else []
+    if action == "play" and index is not None and 0 <= index < len(queue):
+        queue = [*queue[index:], *queue[:index]]
+    elif action == "play-next" and track_key:
+        item, part = raw_track(config, track_key)
+        prepared, _ = finish_prepared_item(config, item, part)
+        queue.insert(1 if queue else 0, prepared)
+    else:
+        raise PlayerError("That queue action is not available.", "invalid-queue-action")
+    prepared_queue, urls = prepare_saved_queue(config, queue)
+    activate_queue(config, prepared_queue, urls, bool(state.get("shuffle")),
+                   str(state.get("repeat", "off")), revision)
+    return queue_view(config)
+
+
+def queue_action(action: str, index: int | None = None, destination: int | None = None,
+                 track_key: str = "") -> dict[str, Any]:
+    if not mpv_running() and action in ("play", "play-next"):
+        return stopped_queue_action(action, index, track_key)
+    prepared_next: tuple[dict[str, Any], str] | None = None
+    config = load_config(False)
+    if action == "play-next" and track_key:
+        required_config = load_config()
+        item, part = raw_track(required_config, track_key)
+        prepared_next = finish_prepared_item(required_config, item, part)
+        config = required_config
+    with player_lock():
+        with state_lock():
+            state = state_for_config(config)
+            stored = state.get("queue", [])
+            queue = list(stored) if isinstance(stored, list) else []
+            running = mpv_running()
+            current = safe_int(property_or("playlist-pos", 0)) if running else -1
+            if running and action in ("remove", "move") and index == current:
+                raise PlayerError("The currently playing track cannot be moved or removed.", "current-track")
+            commands: list[list[Any]] = []
+            if action == "remove" and index is not None and 0 <= index < len(queue):
+                if running:
+                    commands.append(["playlist-remove", index])
+                queue.pop(index)
+            elif action == "move" and index is not None and destination is not None and 0 <= index < len(queue):
+                target = max(0, min(len(queue) - 1, destination))
+                if running:
+                    commands.append(["playlist-move", index, target])
+                item = queue.pop(index)
+                queue.insert(target, item)
+            elif action == "clear-upcoming":
+                for position in range(len(queue) - 1, current, -1):
+                    if running:
+                        commands.append(["playlist-remove", position])
+                    queue.pop(position)
+            elif action == "play" and index is not None and 0 <= index < len(queue):
+                if running:
+                    commands.append(["set_property", "playlist-pos", index])
+            elif action == "play-next" and prepared_next is not None:
+                item, url = prepared_next
+                header = {"http-header-fields": f"X-Plex-Token: {config['token']}"}
+                if loadfile_supports_index():
+                    commands.append(["loadfile", url, "insert-next", -1, header])
+                else:
+                    commands.append(["loadfile", url, "append", header])
+                    commands.append(["playlist-move", len(queue), min(len(queue), current + 1)])
+                queue.insert(min(len(queue), current + 1), item)
+            else:
+                raise PlayerError("That queue action is not available.", "invalid-queue-action")
+            next_state = dict(state)
+            next_state["queue"] = queue
+            if config:
+                next_state["queueNamespace"] = cache_namespace(config)
+            next_state["updated"] = int(time.time())
+            payload = json_bytes(next_state, STATE_MAX_BYTES)
+            snapshot = player_snapshot(state) if commands else {"running": running}
+            try:
+                if commands:
+                    mpv_commands(commands)
+                atomic_bytes(STATE_FILE, payload, maximum=STATE_MAX_BYTES)
+            except Exception:
+                restore_player(config, snapshot)
+                raise
+    if action == "play":
+        status(load_config(False), force_timeline=True)
+    return queue_view(config)
+
+
+def property_or(name: str, fallback: Any) -> Any:
+    try:
+        value = mpv_command(["get_property", name], True)
+        return fallback if value is None else value
+    except (OSError, PlayerError, json.JSONDecodeError):
+        return fallback
+
+
+def status(config: dict[str, Any] | None = None, force_timeline: bool = False) -> dict[str, Any]:
+    config = config if config is not None else load_config(False, include_disabled=True)
+    configured = bool(config)
+    connected = configured and connection_enabled(config)
+    snapshot = mpv_properties(["playlist", "playlist-pos", "pause", "idle-active",
+                               "time-pos", "duration", "volume"])
+    state = sync_queue_from_mpv(config, snapshot.get("playlist") if snapshot else None, snapshot is not None)
+    queue = state.get("queue", []) if isinstance(state, dict) else []
+    if snapshot is None:
+        track = queue[0] if queue else None
+        result = {"configured": configured, "connected": connected, "playing": False, "paused": False,
+                  "track": public_item(track),
+                  "position": 0, "duration": (track.get("duration", 0) if track else 0),
+                  "volume": max(0, min(130, safe_float(state.get("volume"), 100))),
+                  "shuffle": bool(state.get("shuffle")), "repeat": state.get("repeat", "off"),
+                  "queueLength": len(queue), "queueIndex": -1}
+    else:
+        index = safe_int(snapshot.get("playlist-pos"))
+        track = queue[index] if isinstance(queue, list) and 0 <= index < len(queue) else None
+        if track is None and bool(snapshot.get("idle-active")) and isinstance(queue, list) and queue:
+            track = queue[0]
+        paused = bool(snapshot.get("pause"))
+        result = {
+            "configured": configured,
+            "connected": connected,
+            "playing": not paused and not bool(snapshot.get("idle-active")),
+            "paused": paused,
+            "track": public_item(track),
+            "position": safe_float(snapshot.get("time-pos")),
+            "duration": safe_float(snapshot.get("duration"), safe_float(track.get("duration")) if track else 0),
+            "volume": safe_float(snapshot.get("volume"), 100),
+            "shuffle": bool(state.get("shuffle")),
+            "repeat": state.get("repeat", "off"),
+            "queueLength": len(queue),
+            "queueIndex": index,
+        }
+    account = account_state()
+    result.update({"stage": account["stage"], "linked": account["linked"], "account": account["account"],
+                   "serverName": account["serverName"], "library": account["library"]})
+    if connected:
+        update_timeline(config, result, force_timeline)
+    return result
+
+
+def control(action: str, value: float | None = None) -> dict[str, Any]:
+    config = load_config(False)
+    player_state = mpv_properties(["idle-active"])
+    if player_state is None:
+        if action == "toggle":
+            return resume_queue(config)
+        if action == "volume" and value is not None:
+            with state_lock():
+                state = state_for_config(config)
+                next_state = dict(state)
+                next_state["volume"] = max(0, min(130, value))
+                next_state["updated"] = int(time.time())
+                atomic_bytes(STATE_FILE, json_bytes(next_state, STATE_MAX_BYTES), maximum=STATE_MAX_BYTES)
+        return status(config)
+    if action == "toggle" and bool(player_state.get("idle-active")):
+        return resume_queue(config)
+    with player_lock():
+        return control_running(config, action, value)
+
+
+def control_running(config: dict[str, Any], action: str, value: float | None = None) -> dict[str, Any]:
+    commands = {
+        "toggle": ["cycle", "pause"],
+        "next": ["playlist-next", "force"],
+        "previous": ["playlist-prev", "force"],
+        "stop": ["stop"],
+    }
+    if action in commands:
+        mpv_command(commands[action], True)
+    elif action == "seek" and value is not None:
+        mpv_command(["set_property", "time-pos", max(0, value)], True)
+    elif action == "volume" and value is not None:
+        volume = max(0, min(130, value))
+        with state_lock():
+            state = state_for_config(config)
+            next_state = dict(state)
+            next_state["volume"] = volume
+            next_state["updated"] = int(time.time())
+            payload = json_bytes(next_state, STATE_MAX_BYTES)
+            previous = property_or("volume", safe_float(state.get("volume"), 100))
+            try:
+                mpv_command(["set_property", "volume", volume], True)
+                atomic_bytes(STATE_FILE, payload, maximum=STATE_MAX_BYTES)
+            except Exception:
+                with contextlib.suppress(OSError, PlayerError, json.JSONDecodeError):
+                    mpv_command(["set_property", "volume", previous], True)
+                raise
+    elif action == "shuffle":
+        with state_lock():
+            state = state_for_config(config)
+            enabled = not bool(state.get("shuffle"))
+            next_state = dict(state)
+            next_state["shuffle"] = enabled
+            next_state["updated"] = int(time.time())
+            json_bytes(next_state, STATE_MAX_BYTES)
+            snapshot = player_snapshot(state)
+            try:
+                mpv_command(["playlist-shuffle" if enabled else "playlist-unshuffle"], True)
+                playlist = mpv_command(["get_property", "playlist"], True)
+                stored_queue = state.get("queue", [])
+                reordered = reconcile_queue(
+                    stored_queue if isinstance(stored_queue, list) else [],
+                    playlist if isinstance(playlist, list) else [],
+                )
+                if len(reordered) == len(state.get("queue", [])):
+                    next_state["queue"] = reordered
+                payload = json_bytes(next_state, STATE_MAX_BYTES)
+                atomic_bytes(STATE_FILE, payload, maximum=STATE_MAX_BYTES)
+            except Exception:
+                restore_player(config, snapshot)
+                raise
+    elif action == "repeat":
+        with state_lock():
+            state = state_for_config(config)
+            modes = ("off", "all", "one")
+            current = str(state.get("repeat", "off"))
+            mode = modes[(modes.index(current) + 1) % len(modes)] if current in modes else "off"
+            next_state = dict(state)
+            next_state["repeat"] = mode
+            next_state["updated"] = int(time.time())
+            payload = json_bytes(next_state, STATE_MAX_BYTES)
+            snapshot = player_snapshot(state)
+            try:
+                mpv_command(["set_property", "loop-file", "inf" if mode == "one" else "no"], True)
+                mpv_command(["set_property", "loop-playlist", "inf" if mode == "all" else "no"], True)
+                atomic_bytes(STATE_FILE, payload, maximum=STATE_MAX_BYTES)
+            except Exception:
+                restore_player(config, snapshot)
+                raise
+    else:
+        raise PlayerError("Unknown player action.")
+    time.sleep(0.04)
+    return status(config, force_timeline=action in ("toggle", "next", "previous", "stop", "seek"))
+
+
+def configure(args: argparse.Namespace) -> None:
+    previous = load_config(False, include_disabled=True)
+    server = normalize_server_url(args.server or input(
+        f"Plex server URL [{previous.get('server', 'http://localhost:32400')}]: ").strip()
+        or previous.get("server", "http://localhost:32400"))
+    token = getpass.getpass("Plex access token: ") or previous.get("token", "")
+    candidate = {"server": server, "token": token,
+                 "clientIdentifier": previous.get("clientIdentifier") or client_identifier()}
+    choose_music_library(candidate, args.section, interactive=True)
+    replace_account(candidate)
+    print(f"Configured Plexarchy with library: {candidate['sectionTitle']}")
+
+
+def connection_health() -> dict[str, Any]:
+    config = load_config(False, include_disabled=True)
+    if not config:
+        stage = account_state()["stage"]
+        message = ("Choose the Plex server to play from." if stage == "servers"
+                   else "Link your Plex account to start listening.")
+        return {"ok": False, "configured": False, "connected": False, "code": "unconfigured",
+                "stage": stage, "message": message}
+    if not connection_enabled(config):
+        return {"ok": False, "configured": True, "connected": False, "code": "disconnected",
+                "message": "The Plex connection is turned off.", "server": config.get("server", ""),
+                "library": config.get("sectionTitle", "Music")}
+    try:
+        available = sections(config)
+        if not available:
+            return {"ok": False, "code": "no-library", "message": "Plex is connected, but no music library was found."}
+        selected = str(config.get("section", ""))
+        if selected and not any(row["key"] == selected for row in available):
+            return {"ok": False, "code": "library-missing", "message": "The selected music library no longer exists."}
+        return {"ok": True, "configured": True, "connected": True, "code": "connected",
+                "message": f"Connected to {config.get('sectionTitle', 'Plex music')}",
+                "server": config.get("server", ""), "library": config.get("sectionTitle", "Music")}
+    except PlayerError as error:
+        if error.code in ("dns", "unreachable", "timeout", "unauthorized") and refresh_server_connection(config):
+            return connection_health()
+        server = str(config.get("server", ""))
+        host = urllib.parse.urlparse(server).hostname or ""
+        if host.endswith(".ts.net") and error.code in ("dns", "unreachable", "timeout"):
+            return {"ok": False, "code": "tailscale", "message": "The Tailscale Plex server is offline or this device is not connected to the tailnet.", "server": server}
+        return {"ok": False, "code": error.code, "message": str(error), "server": server}
+
+
+def doctor() -> dict[str, Any]:
+    config = load_config(False, include_disabled=True)
+    health = connection_health()
+    mpris_paths = (pathlib.Path("/etc/mpv/scripts/mpris.so"), pathlib.Path("/usr/lib/mpv-mpris/mpris.so"))
+    mpris = next((str(path) for path in mpris_paths if path.is_file()), "")
+    warnings = []
+    if not mpris:
+        warnings.append("mpv-mpris is not installed; hardware media keys and desktop media controls are unavailable.")
+    config_info = secure_stat(CONFIG_FILE)
+    config_private = bool(config_info and stat.S_ISREG(config_info.st_mode)
+                          and config_info.st_uid == os.geteuid()
+                          and stat.S_IMODE(config_info.st_mode) == 0o600)
+    if config_info and not config_private:
+        warnings.append("The Plex configuration file is not private; expected mode 0600.")
+    try:
+        with secure_parent_directory(CACHE_DIR / ".directory-check"):
+            cache_private = True
+    except FileNotFoundError:
+        cache_private = True
+    except PlayerError:
+        cache_private = False
+    return {
+        "ok": bool(health.get("ok")) and bool(shutil_which("mpv")),
+        "configured": bool(config),
+        "connected": bool(config) and connection_enabled(config),
+        "connection": health,
+        "configFile": str(CONFIG_FILE),
+        "configPrivate": config_private,
+        "mpv": shutil_which("mpv") or "",
+        "mpris": mpris,
+        "warnings": warnings,
+        "cache": {"path": str(CACHE_DIR), "private": cache_private},
+    }
+
+
+def demo_cover(index: int) -> str:
+    path = pathlib.Path(__file__).resolve().parents[1] / "demo" / f"cover-{(index % 4) + 1}.svg"
+    return path.as_uri() if path.exists() else ""
+
+
+def demo_items(kind: str = "album") -> list[dict[str, Any]]:
+    names = [
+        ("Night Lines", "Mara Vale"), ("Copper Static", "Low Atlas"),
+        ("Soft Machinery", "Juniper Room"), ("Afterimage", "Signal Coast"),
+        ("Northbound", "Mara Vale"), ("Borrowed Light", "Glass Hours"),
+    ]
+    if kind == "artist":
+        unique = list(dict.fromkeys(artist for _, artist in names))
+        return [{"key": f"artist-{index}", "type": "artist", "title": artist, "artist": artist,
+                 "album": "", "thumb": demo_cover(index), "leafCount": index + 2} for index, artist in enumerate(unique)]
+    if kind == "playlist":
+        return [{"key": "playlist-1", "type": "playlist", "title": "Late shift", "artist": "12 tracks", "album": "",
+                 "thumb": demo_cover(3), "leafCount": 12}]
+    if kind == "track":
+        return [{"key": f"track-{index}", "type": "track", "title": title, "artist": artist,
+                 "album": "Night Lines", "duration": 174 + index * 13, "thumb": demo_cover(index), "index": index + 1}
+                for index, (title, artist) in enumerate(names)]
+    return [{"key": f"album-{index}", "type": "album", "title": title, "artist": artist,
+             "album": title, "year": 2021 + (index % 5), "thumb": demo_cover(index), "leafCount": 8 + index}
+            for index, (title, artist) in enumerate(names)]
+
+
+def demo_dispatch(args: argparse.Namespace) -> Any:
+    if args.command in ("status", "control", "play", "play-collection"):
+        tracks = demo_items("track")
+        return {"configured": True, "connected": True, "playing": True, "paused": False, "track": tracks[1], "position": 72,
+                "duration": tracks[1]["duration"], "volume": 84, "shuffle": True, "repeat": "all",
+                "queueLength": len(tracks), "queueIndex": 1, "demo": True,
+                "stage": "ready", "linked": True, "account": "demo", "serverName": "Demo server", "library": "Demo library"}
+    if args.command == "account":
+        return {"linked": True, "configured": True, "stage": "ready", "account": "demo", "server": "",
+                "serverName": "Demo server", "library": "Demo library", "connectionEnabled": True,
+                "linkPending": False, "linkCode": "", "linkUrl": "", "demo": True}
+    if args.command == "queue":
+        items = demo_items("track")
+        for index, item in enumerate(items):
+            item.update({"queueIndex": index, "current": index == 1, "played": index < 1})
+        return {"items": items, "currentIndex": 1, "shuffle": True, "repeat": "all", "demo": True}
+    if args.command in ("recent", "library", "search"):
+        view = getattr(args, "view", "recent")
+        kind = "artist" if view == "artists" else ("playlist" if view == "playlists" else ("track" if view in ("history", "favorites", "frequent") else "album"))
+        return {"items": demo_items(kind), "library": "Demo library", "stale": False, "demo": True}
+    if args.command in ("tracks", "children"):
+        child_kind = "album" if getattr(args, "kind", "") == "artist" else "track"
+        return {"items": demo_items(child_kind), "demo": True}
+    if args.command in ("health", "doctor"):
+        return {"ok": True, "code": "demo", "message": "Demo mode — no Plex connection is used.", "demo": True}
+    if args.command == "cache-clean":
+        return {"removed": 0, "bytes": 0, "demo": True}
+    if args.command in ("logout", "shutdown"):
+        return {"connected": False, "stopped": True, "demo": True}
+    if args.command == "connection":
+        return {"configured": True, "connected": args.state == "on", "stopped": args.state == "off", "demo": True}
+    if args.command == "art":
+        return {"thumb": "", "demo": True}
+    if args.command == "queue-action":
+        return demo_dispatch(argparse.Namespace(command="queue"))
+    raise PlayerError("This action is not available in demo mode.", "demo")
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description="Plex music browser and mpv controller for Omarchy")
+    root.add_argument("--demo", action="store_true", help="use fictional data without Plex or mpv")
+    commands = root.add_subparsers(dest="command", required=True)
+    login_parser = commands.add_parser("login", help="connect through the Plex browser sign-in flow")
+    login_parser.add_argument("--server", default="", help="skip server discovery and use this address")
+    login_parser.add_argument("--section", default="")
+    login_parser.add_argument("--no-browser", action="store_true")
+    commands.add_parser("logout", help="remove the stored Plex account token")
+    link_parser = commands.add_parser("link", help="non-interactive plex.tv PIN linking used by the panel")
+    link_parser.add_argument("step", choices=("start", "poll", "cancel"))
+    commands.add_parser("account", help="print the account linking and server selection state")
+    commands.add_parser("servers", help="list the Plex servers on the linked account")
+    select_server_parser = commands.add_parser("select-server", help="use a discovered Plex server")
+    select_server_parser.add_argument("id", help="server clientIdentifier from the servers command")
+    commands.add_parser("libraries", help="list music libraries on the selected server")
+    select_library_parser = commands.add_parser("select-library", help="use a music library")
+    select_library_parser.add_argument("key")
+    commands.add_parser("shutdown", help="stop playback and terminate the Plexarchy mpv process")
+    connection_parser = commands.add_parser("connection", help="enable or disable Plex without removing credentials")
+    connection_parser.add_argument("state", choices=("on", "off"))
+    setup = commands.add_parser("configure", help="store Plex connection details")
+    setup.add_argument("--server")
+    setup.add_argument("--section")
+    recent_parser = commands.add_parser("recent", help="list recently added albums")
+    recent_parser.add_argument("--limit", type=int, default=20)
+    library_parser = commands.add_parser("library", help="browse a Plex music library view")
+    library_parser.add_argument("view", choices=("recent", "artists", "albums", "playlists", "history", "favorites", "frequent"))
+    library_parser.add_argument("--limit", type=int, default=100)
+    search_parser = commands.add_parser("search", help="search albums and tracks")
+    search_parser.add_argument("query")
+    search_parser.add_argument("--limit", type=int, default=30)
+    art_parser = commands.add_parser("art", help="cache one visible Plex artwork image")
+    art_parser.add_argument("source")
+    tracks_parser = commands.add_parser("tracks", help="list tracks in an album")
+    tracks_parser.add_argument("album")
+    children_parser = commands.add_parser("children", help="browse an artist, album, or playlist")
+    children_parser.add_argument("kind", choices=("artist", "album", "playlist"))
+    children_parser.add_argument("key")
+    play_parser = commands.add_parser("play", help="play a track")
+    play_parser.add_argument("track")
+    play_parser.add_argument("--album")
+    play_parser.add_argument("--playlist")
+    play_parser.add_argument("--shuffle", action="store_true")
+    collection_parser = commands.add_parser("play-collection", help="play or shuffle an album or playlist")
+    collection_parser.add_argument("kind", choices=("album", "playlist"))
+    collection_parser.add_argument("key")
+    collection_parser.add_argument("--shuffle", action="store_true")
+    control_parser = commands.add_parser("control", help="control mpv")
+    control_parser.add_argument("action", choices=("toggle", "next", "previous", "stop", "seek", "volume", "shuffle", "repeat"))
+    control_parser.add_argument("value", nargs="?", type=float)
+    commands.add_parser("queue", help="show the active playback queue")
+    queue_parser = commands.add_parser("queue-action", help="edit the active playback queue")
+    queue_parser.add_argument("action", choices=("remove", "move", "clear-upcoming", "play", "play-next"))
+    queue_parser.add_argument("--index", type=int)
+    queue_parser.add_argument("--to", type=int)
+    queue_parser.add_argument("--track", default="")
+    commands.add_parser("status", help="print player status")
+    commands.add_parser("health", help="check the Plex connection")
+    commands.add_parser("doctor", help="check runtime and configuration")
+    cache_parser = commands.add_parser("cache-clean", help="remove old and excessive cached data")
+    cache_parser.add_argument("--max-age-days", type=int, default=30)
+    cache_parser.add_argument("--max-megabytes", type=int, default=256)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        result: Any = None
+        if args.demo:
+            print(json.dumps(demo_dispatch(args), ensure_ascii=False))
+            return 0
+        if args.command != "cache-clean":
+            maybe_cleanup_cache()
+        if args.command == "login":
+            result = login(args.server, args.section, args.no_browser)
+        elif args.command == "logout":
+            result = logout()
+        elif args.command == "link":
+            result = link_start() if args.step == "start" else (link_poll() if args.step == "poll" else link_cancel())
+        elif args.command == "account":
+            result = account_state()
+        elif args.command == "servers":
+            result = list_servers()
+        elif args.command == "select-server":
+            result = select_server(args.id)
+        elif args.command == "libraries":
+            result = list_libraries()
+        elif args.command == "select-library":
+            result = select_library(args.key)
+        if args.command == "configure":
+            configure(args)
+            return 0
+        elif args.command == "status":
+            result = status()
+        elif args.command == "shutdown":
+            result = shutdown_player()
+        elif args.command == "connection":
+            result = set_connection(args.state == "on")
+        elif args.command == "recent":
+            config = load_config()
+            result = cached_items(config, f"recent-{args.limit}", lambda: recent(config, args.limit))
+            result["library"] = config.get("sectionTitle", "Music")
+        elif args.command == "library":
+            config = load_config()
+            result = cached_items(config, f"library-{config.get('section', '')}-{args.view}-{args.limit}",
+                                  lambda: library_list(config, args.view, args.limit))
+            result.update({"view": args.view, "library": config.get("sectionTitle", "Music")})
+        elif args.command == "search":
+            config = load_config()
+            result = {"items": search(config, args.query, args.limit), "query": args.query}
+        elif args.command == "art":
+            result = {"thumb": art_path(load_config(), args.source)}
+        elif args.command == "tracks":
+            result = {"items": album_tracks(load_config(), args.album), "album": args.album}
+        elif args.command == "children":
+            config = load_config()
+            loader = artist_albums if args.kind == "artist" else (playlist_tracks if args.kind == "playlist" else album_tracks)
+            result = cached_items(config, f"children-{args.kind}-{args.key}", lambda: loader(config, args.key))
+            result.update({"kind": args.kind, "key": args.key})
+        elif args.command == "play":
+            result = play(load_config(), args.track, args.album, args.playlist, args.shuffle)
+        elif args.command == "play-collection":
+            result = play_collection(load_config(), args.kind, args.key, args.shuffle)
+        elif args.command == "control":
+            result = control(args.action, args.value)
+        elif args.command == "queue":
+            result = queue_view()
+        elif args.command == "queue-action":
+            result = queue_action(args.action, args.index, args.to, args.track)
+        elif args.command == "health":
+            result = connection_health()
+        elif args.command == "doctor":
+            result = doctor()
+        elif args.command == "cache-clean":
+            result = cleanup_cache(max(1, args.max_age_days), max(1, args.max_megabytes) * 1024 * 1024)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    except PlayerError as error:
+        print(json.dumps({"ok": False, "code": error.code, "message": str(error)}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print(json.dumps({"ok": False, "code": "local-error", "message": str(error)}, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

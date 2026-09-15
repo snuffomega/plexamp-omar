@@ -1,0 +1,43 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install mpv for the end-to-end test
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y mpv
+      - run: python3 -m py_compile bin/plexarchy
+      - run: python3 -m unittest discover -s tests -v
+
+  qml:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: python3 tests/validate_manifest.py
+      - run: node --test tests/test_model.js
+      - name: Install Qt 6 QML runtime and mpv
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y mpv qt6-declarative-dev-tools qml6-module-qtquick \
+            qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-templates \
+            qml6-module-qtquick-window qml6-module-qtquick-shapes qml6-module-qtqml qml6-module-qtqml-workerscript
+      - name: Parse and format-check QML
+        run: /usr/lib/qt6/bin/qmlformat Panel.qml >/dev/null
+      - name: Headless Panel.qml harness
+        run: PATH="/usr/lib/qt6/bin:$PATH" python3 tests/qml-harness/run.py
